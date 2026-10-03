@@ -1,0 +1,136 @@
+"""results_table.py — Result logging, loading, and Excel export.
+
+Nhiệm vụ: lưu kết quả từng lần chạy ra JSON, rồi điền vào experiments.xlsx từ mẫu
+templates/experiment_table_template.xlsx (đừng gõ tay hàng chục dòng, rất dễ sai).
+
+Tên cột của sheet "Experiments" (giữ nguyên, đúng thứ tự mẫu):
+    exp_id, group, description, loss, optimizer, lr, weight_decay, batch, epochs, hidden, dropout,
+    clip_norm, precision, init, seed, step0_loss, best_val_loss, best_epoch, final_train_loss,
+    final_val_loss, val_acc, val_macro_f1, time_per_epoch_s, peak_mem_MB, diverged,
+    eval_acc, eval_macro_f1, figure_file, notes
+(các cột công thức ở cuối bảng mẫu tự tính, đừng ghi đè)
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import openpyxl
+
+
+def save_result(result: dict, results_dir: str = "../results") -> str:
+    """Ghi result["cfg"], result["history"], result["summary"] (KHÔNG ghi best_state) ra
+    <results_dir>/<exp_id>.json. Trả về đường dẫn file. Tạo thư mục nếu chưa có."""
+    out_dir = Path(results_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    exp_id = result["cfg"]["exp_id"]
+    out_path = out_dir / f"{exp_id}.json"
+
+    # Chỉ lưu các trường có thể tuần tự hóa JSON
+    data = {
+        "cfg": {k: (list(v) if isinstance(v, tuple) else v) for k, v in result["cfg"].items()},
+        "history": result["history"],
+        "summary": result["summary"],
+    }
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    return str(out_path)
+
+
+def load_results(results_dir: str = "../results") -> list[dict]:
+    """Đọc mọi file *.json trong results_dir, trả về danh sách dict (sắp theo exp_id)."""
+    p = Path(results_dir)
+    if not p.exists():
+        return []
+    json_files = sorted(p.glob("*.json"), key=lambda f: f.name)
+    results = []
+    for jf in json_files:
+        with open(jf, "r", encoding="utf-8") as f:
+            results.append(json.load(f))
+    return results
+
+
+def to_row(result: dict, eval_scores: dict | None = None, notes: str = "") -> dict:
+    """Biến một kết quả thành một dòng của bảng: gộp cfg + summary (+ eval_acc, eval_macro_f1 nếu có)
+    + figure_file = f"figures/{exp_id}.png". Khoá phải trùng tên cột ở đầu file.
+    Chỉ truyền eval_scores cho baseline và cấu hình cuối cùng."""
+    cfg = result["cfg"]
+    summary = result["summary"]
+    exp_id = cfg["exp_id"]
+
+    row = {
+        "exp_id": exp_id,
+        "group": cfg.get("group", ""),
+        "description": cfg.get("description", ""),
+        "loss": cfg.get("loss", "ce"),
+        "optimizer": cfg.get("optimizer", "sgd_momentum"),
+        "lr": cfg.get("lr", ""),
+        "weight_decay": cfg.get("weight_decay", 0.0),
+        "batch": cfg.get("batch", 512),
+        "epochs": cfg.get("epochs", 20),
+        "hidden": str(cfg.get("hidden", (256, 128))),
+        "dropout": cfg.get("dropout", 0.0),
+        "clip_norm": cfg.get("clip_norm", ""),
+        "precision": cfg.get("precision", "fp32"),
+        "init": cfg.get("init", "he"),
+        "seed": cfg.get("seed", 1),
+        "step0_loss": summary.get("step0_loss", ""),
+        "best_val_loss": summary.get("best_val_loss", ""),
+        "best_epoch": summary.get("best_epoch", ""),
+        "final_train_loss": summary.get("final_train_loss", ""),
+        "final_val_loss": summary.get("final_val_loss", ""),
+        "val_acc": summary.get("val_acc", ""),
+        "val_macro_f1": summary.get("val_macro_f1", ""),
+        "time_per_epoch_s": summary.get("time_per_epoch_s", ""),
+        "peak_mem_MB": summary.get("peak_mem_MB", ""),
+        "diverged": summary.get("diverged", False),
+        "eval_acc": eval_scores.get("accuracy", "") if eval_scores else "",
+        "eval_macro_f1": eval_scores.get("macro_f1", "") if eval_scores else "",
+        "figure_file": f"figures/{exp_id}.png",
+        "notes": notes or cfg.get("notes", ""),
+    }
+    return row
+
+
+def write_xlsx(rows: list[dict], template_path: str, out_path: str,
+               group_comments: dict[str, str] | None = None) -> None:
+    """Điền các dòng vào sheet "Experiments" của mẫu, từ dòng 2 trở xuống, rồi lưu thành out_path.
+
+    Các bước (openpyxl):
+      1. wb = openpyxl.load_workbook(template_path)   # KHÔNG dùng data_only=True (sẽ mất công thức)
+      2. ws = wb["Experiments"]; đọc tiêu đề dòng 1 để biết cột nào ứng với khoá nào
+      3. với mỗi row: ghi giá trị vào đúng cột; BỎ QUA các cột công thức
+      4. ws_sum = wb["Summary"]: điền nhận xét nếu có
+      5. wb.save(out_path)
+    """
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["Experiments"]
+
+    header = [cell.value for cell in ws[1]]
+    formula_cols = {"step0_gap_vs_lnC", "gap_val_minus_train", "delta_val_f1_vs_base", "beyond_noise"}
+
+    for r_idx, row_dict in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(header, start=1):
+            if col_name in formula_cols:
+                # Đảm bảo công thức được cập nhật cho dòng r_idx nếu vượt quá dòng mẫu
+                continue
+            if col_name in row_dict:
+                val = row_dict[col_name]
+                # Chuyển chuỗi None hoặc float nan thành rỗng
+                if val is None or val == "None":
+                    val = ""
+                ws.cell(row=r_idx, column=col_idx, value=val)
+
+    # Điền nhận xét trong sheet Summary
+    if group_comments and "Summary" in wb.sheetnames:
+        ws_sum = wb["Summary"]
+        for r in range(2, 12):
+            grp = ws_sum.cell(row=r, column=1).value
+            if grp in group_comments:
+                ws_sum.cell(row=r, column=8, value=group_comments[grp])
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    print(f"Đã lưu bảng Excel thành công vào {out_path}")
